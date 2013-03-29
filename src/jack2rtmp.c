@@ -6,6 +6,7 @@
 #include <netinet/tcp.h> // setsockopt
 #include <ev.h>
 #include <jack/jack.h>
+#include <jack/ringbuffer.h>
 #include <lame/lame.h>
 #include <librtmp/rtmp.h>
 #include "flv.h"
@@ -16,19 +17,24 @@
 struct ev_loop *loop;
 struct ev_signal sigint_sig;
 static ev_async async;
+
 jack_client_t *client;
 jack_port_t *output_port;
+jack_ringbuffer_t *ringbuf;
+char *framebuf;
+int buffer_size = 300000;
+int buffer_samples = 1024*4; // минимум 1024
+
 lame_global_flags *mp3;
+
 RTMP *rtmp_o;
-RTMPPacket rtmp_r;
 RTMPPacket rtmp_w;
 int rtmp_i;
-unsigned char *buffer;
-int buffer_size = 30000;
-int buffer_writed = 0;
-int buffer_samples;
+uint32_t start_time;
 
 
+
+/*
 static char *put_amf_string(char *pb, const char *str) {
 	char *pb2 = pb;
 	uint16_t len = strlen(str);
@@ -39,11 +45,11 @@ static char *put_amf_string(char *pb, const char *str) {
 	pb2 += len;
 	return pb2;
 }
+*/
 
 static void sigint_cb (struct ev_loop *loop, struct ev_signal *w, int revents) {
 	jack_client_close(client);
 	if (RTMP_IsConnected(rtmp_o)) RTMP_Close(rtmp_o);
-	//exit(EXIT_SUCCESS);
 	ev_unloop(loop, EVUNLOOP_ALL);
 }
 
@@ -53,40 +59,43 @@ void jack_shutdown (void *arg) {
 
 int jack_callback (jack_nframes_t nframes, void *arg) {
 	int jack_bsize = nframes * sizeof(jack_default_audio_sample_t);
-	jack_default_audio_sample_t *jack_b = jack_port_get_buffer(output_port, nframes);
-	memcpy(buffer + buffer_writed, jack_b, jack_bsize);
-	buffer_writed += jack_bsize;
-	if (buffer_writed + jack_bsize < buffer_size) {
-		return 0;
+	const char *jack_b = jack_port_get_buffer(output_port, nframes);
+	if (jack_ringbuffer_write(ringbuf, (void *) jack_b, jack_bsize) < jack_bsize) {
+		fprintf(stderr, "buffer underrun!\n");
 	}
-	buffer_samples = buffer_writed >> 2;
-	buffer_writed = 0;
-	if ( !rtmp_i ) {
-		return 0;
+	if ( rtmp_i && jack_ringbuffer_read_space(ringbuf) >= (buffer_samples * sizeof(jack_default_audio_sample_t)) ) {
+		ev_async_send(loop, &async);
 	}
-	ev_async_send(loop, &async);
 	return 0;
 }
 
 
 static void send_cb(EV_P_ ev_async *w, int revents) {
-	fprintf(stderr, "sending %d bytes of data\n", buffer_samples << 2);
-	int rtmp_size = RTMP_MAX_HEADER_SIZE + 1 + 7200 + buffer_samples * 5 / 4;
+	jack_ringbuffer_read(ringbuf, framebuf, (buffer_samples * sizeof(jack_default_audio_sample_t)) );
+	int rtmp_size = RTMP_MAX_HEADER_SIZE + 1 + buffer_samples * 5 / 4 + 7200;
 	unsigned char *rtmp_buffer = malloc(rtmp_size);
-	int mp3size = lame_encode_buffer_ieee_float(mp3, (const float *) buffer, NULL, buffer_samples, rtmp_buffer + RTMP_MAX_HEADER_SIZE + 1, rtmp_size - RTMP_MAX_HEADER_SIZE - 1);
+	int mp3size = lame_encode_buffer_ieee_float(mp3, (const float *) framebuf, NULL, buffer_samples, rtmp_buffer + RTMP_MAX_HEADER_SIZE + 1, rtmp_size - RTMP_MAX_HEADER_SIZE - 1);
 	if ( mp3size < 0 ) {
 		fprintf(stderr, "mp3 encoding error %d . buffer_samples %d\n", mp3size, buffer_samples);
 	} else {
-		rtmp_buffer[RTMP_MAX_HEADER_SIZE] = FLV_CODECID_MP3 | FLV_SAMPLERATE_44100HZ | FLV_SAMPLESSIZE_16BIT | FLV_MONO;
-		rtmp_w.m_headerType = RTMP_PACKET_SIZE_LARGE;
+		if (!start_time) {
+			rtmp_w.m_headerType = RTMP_PACKET_SIZE_LARGE;
+			rtmp_w.m_nInfoField2 = rtmp_o->m_stream_id;
+			rtmp_w.m_nTimeStamp = 0;
+			start_time = RTMP_GetTime();
+		} else {
+			rtmp_w.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
+			rtmp_w.m_nTimeStamp = RTMP_GetTime()-start_time;
+		}
 		rtmp_w.m_nChannel = 0x04; // source channel
-		rtmp_w.m_packetType = RTMP_PACKET_TYPE_AUDIO;
-		rtmp_w.m_nInfoField2 = rtmp_o->m_stream_id;
 		rtmp_w.m_body = (char *) rtmp_buffer + RTMP_MAX_HEADER_SIZE;
 		rtmp_w.m_nBodySize = mp3size + 1;
+		rtmp_w.m_packetType = RTMP_PACKET_TYPE_AUDIO;
+		rtmp_buffer[RTMP_MAX_HEADER_SIZE] = FLV_CODECID_MP3 | FLV_SAMPLERATE_44100HZ | FLV_SAMPLESSIZE_16BIT | FLV_MONO;
 		if ( !RTMP_SendPacket(rtmp_o, &rtmp_w, FALSE) ) { // queue учитывается только для INVOKE
-			perror("RTMP_SendPacket error\n");
+			fprintf(stderr, "RTMP_SendPacket error\n");
 		}
+		//fprintf(stderr, "sent %d bytes of data. time: %d\n", (buffer_samples * (int)sizeof(jack_default_audio_sample_t)), rtmp_w.m_nTimeStamp );
 	}
 	free(rtmp_buffer);
 }
@@ -116,10 +125,11 @@ int main (int argc, char **argv) {
 
 // jack
 	jack_status_t status;
-	buffer = malloc(buffer_size);
+	ringbuf = jack_ringbuffer_create(buffer_size);
+	framebuf = malloc(buffer_samples * sizeof(jack_default_audio_sample_t));
 	client = jack_client_open("jack2rtmp", JackNullOption, &status);
 	if (client == NULL) {
-		perror("jack server not running?\n");
+		fprintf(stderr, "jack server not running?\n");
 		return EXIT_FAILURE;
 	}
 	jack_on_shutdown(client, jack_shutdown, NULL);
@@ -128,7 +138,7 @@ int main (int argc, char **argv) {
 	output_port = jack_port_register(client, "1", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
 	//jack_port_register(client, "2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
 	if (jack_activate(client)) {
-		perror("cannot activate client");
+		fprintf(stderr, "cannot activate client");
 	}
 
 // lame
@@ -144,7 +154,7 @@ int main (int argc, char **argv) {
 // rtmp
 	rtmp_o = RTMP_Alloc();
 	if (rtmp_o == NULL) {
-		perror("RTMP_Alloc\n");
+		fprintf(stderr, "RTMP_Alloc\n");
 		return EXIT_FAILURE;
 	}
 	RTMP_Init(rtmp_o);
@@ -152,12 +162,13 @@ int main (int argc, char **argv) {
 	RTMP_EnableWrite(rtmp_o);
 	if (!RTMP_Connect(rtmp_o, NULL) || !RTMP_ConnectStream(rtmp_o, 0)) {
 		RTMP_Free(rtmp_o);
-		perror("Can not connect.\n");
+		fprintf(stderr, "Can not connect.\n");
 		return EXIT_FAILURE;
 	} else {
-		perror("Connected.\n");
+		fprintf(stderr, "Connected.\n");
 	}
 
+/*
 	char *rtmp_buffer = malloc(4096);
 	char *rtmp_top = rtmp_buffer + RTMP_MAX_HEADER_SIZE;
 	char *outend = rtmp_buffer + 4096;
@@ -203,10 +214,10 @@ int main (int argc, char **argv) {
 	rtmp_w.m_nInfoField2 = rtmp_o->m_stream_id;
 	rtmp_w.m_body = rtmp_buffer + RTMP_MAX_HEADER_SIZE;
 	if ( !RTMP_SendPacket(rtmp_o, &rtmp_w, TRUE) ) {
-		perror("RTMP_SendPacket error\n");
+		fprintf(stderr, "RTMP_SendPacket error\n");
 	}
 	free(rtmp_buffer);
-
+*/
 
 	int off = 0;
 	setsockopt(RTMP_Socket(rtmp_o), SOL_TCP, TCP_NODELAY, &off, sizeof(off));
@@ -218,6 +229,7 @@ int main (int argc, char **argv) {
 	ev_loop(loop, 0);
 
 
+	jack_ringbuffer_free(ringbuf);
 	//jack_client_close(client);
 	return EXIT_SUCCESS;
 }
